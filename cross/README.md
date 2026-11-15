@@ -12,7 +12,7 @@ make clean      # removes build/
 make distclean  # also removes toolchain/
 ```
 
-17.17 built here is byte-identical to the one tested on the A3000 (2026-11-15).
+17.18 built here is byte-identical to the one tested on the A3000 (2026-11-16).
 
 Defaults can be overridden, for example `make NDK=/path/to/NDK3.2R4`:
 

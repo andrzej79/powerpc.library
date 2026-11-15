@@ -1525,10 +1525,22 @@ static void priLeaveRun(struct PrivatePPCBase* PowerPCBase, struct TaskPPC* task
  *      slice and take the decay anyway (:4616-4631) -- the task keeps the CPU
  *      but still pays for what it used, which is what stops a lone busy task
  *      from holding a high effective priority for ever.
- *   3. OTHERWISE switch only if the ready head's effective priority is
- *      STRICTLY greater than ours (:4643-4656, "cmpw r4,r5 / bgt
- *      .savecontext"). Equal priorities do not preempt; the running task
- *      keeps the CPU until its quantum expires.
+ *   3. OTHERWISE switch if the ready head's effective priority is at least
+ *      ours. THIS DIVERGES FROM THE ORIGINAL ON PURPOSE: there the
+ *      head has to be STRICTLY greater (:4643-4656, "cmpw r4,r5 / bgt
+ *      .savecontext"), so a task of equal priority waits until the running
+ *      one waits or uses up its quantum. Here every task normally has the
+ *      same effective priority (CPUStats leaves tp_Priority and tp_Prioffset
+ *      at 0 - seen with tests/ppctasks), so the strict test meant no
+ *      preemption at all, where 17.15 and earlier took the ready head on
+ *      every pass. The Settlers II intro player (AMPS2, Riva 2003, with its
+ *      MPEG plugins) hung for good under that: after "no suitable mode" every
+ *      PPC task ended up waiting for a signal nobody sent, AMPS2 polling
+ *      with WaitTime. Taking an equal-priority head again (round robin among
+ *      equals, as 17.15) fixes it; a lower one still waits for the quantum.
+ *      Found 2026-11-16 by bisecting 17.15..17.17 on the A3000 down to this
+ *      test (936ad8a, FIXES.md item 1). Quake II GL timedemo unchanged
+ *      (19.78 ms against 19.77-19.78).
  */
 static LONG priShouldSwitch(struct PrivatePPCBase* PowerPCBase, struct TaskPPC* curr)
 {
@@ -1561,7 +1573,7 @@ static LONG priShouldSwitch(struct PrivatePPCBase* PowerPCBase, struct TaskPPC* 
         return 0;
     }
 
-    return (priEffective(head) > priEffective(curr));
+    return (priEffective(head) >= priEffective(curr));
 }
 
 PPCKERNEL void SwitchPPC(__reg("r3") struct PrivatePPCBase* PowerPCBase, __reg("r4") struct iframe* iframe)

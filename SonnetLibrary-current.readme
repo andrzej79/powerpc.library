@@ -2,7 +2,7 @@ Short:		Driver for G3/G4 PCI cards
 Uploader:	dennisvdboon@gmail.com (Dennis Boon)
 Author:		dennisvdboon -> gmail (Dennis Boon)
 Type:		driver/other
-Version:	17.17
+Version:	17.18
 Architecture:	m68k-amigaos = 3.9
 Distribution:	Aminet
 URL:		https://github.com/Sakura-IT/SonnetAmiga
@@ -183,6 +183,15 @@ It was a fun 9 year ride and thanks for your support! :-)
 -+-+-+-+-+-+-+-+-+-+-+-+-+
 
 What has changed since 17.16:
+
+Scheduler (17.18):
+- A ready task of the same priority as the running one gets the CPU again at
+  the next scheduler pass, as up to 17.15. 17.16 switched only to a task of
+  strictly higher priority (WarpOS's rule), and as every task normally has the
+  same priority, a running task kept the CPU until it waited or its time
+  slice ran out. The Settlers II intro player (AMPS2, Riva) hung for good with
+  that, and so the game never started. A task of lower priority still waits
+  for the time slice to run out.
 
 Program loader (17.17):
 - The 68K reads PPC memory uncached, at about 5 MB/s on an A3000 with a
