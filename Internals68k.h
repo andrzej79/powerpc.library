@@ -47,6 +47,7 @@ void kprintf(STRPTR format, ...);
 #define _LVOFreeXMsgPPC         -672    //F6: "lwz r0,-670(r3)", ppc-warpos inline/powerpc_protos.h:198, the entry's address word at LVO+2
 #define _LVOLoadSeg             -150
 #define _LVONewLoadSeg          -768
+#define _LVOUnLoadSeg           -156
 #define _LVOAllocMem            -198
 #define _LVOAddTask             -282
 #define _LVORemTask             -288
@@ -58,6 +59,8 @@ void kprintf(STRPTR format, ...);
 PATCH68K BPTR   patchLoadSeg   (__reg("d1") STRPTR name, __reg("a6") struct DosLibrary* DOSBase);
 PATCH68K BPTR   patchNewLoadSeg(__reg("d1") STRPTR file, __reg("d2") struct TagItem* tags,
                        __reg("a6") struct DosLibrary* DOSBase);
+PATCH68K BOOL   patchUnLoadSeg (__reg("d1") BPTR seglist, __reg("a6") struct DosLibrary* DOSBase);
+BOOL            PPCSegTask     (struct Task* task);    //17.17: is this task running a seglist with PPC code (myOpen)
 PATCH68K APTR   patchAllocMem  (__reg("d0") ULONG byteSize, __reg("d1") ULONG attributes,
                        __reg("a6") struct ExecBase* SysBase);
 PATCH68K APTR   patchAddTask   (__reg("a1") struct Task* myTask, __reg("a2") APTR initialPC,

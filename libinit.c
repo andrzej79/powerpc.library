@@ -51,7 +51,7 @@
 #include "Internalsppc.h"
 #include "Internals68k.h"
 
-APTR OldLoadSeg, OldNewLoadSeg, OldAllocMem, OldAddTask, OldRemTask;
+APTR OldLoadSeg, OldNewLoadSeg, OldAllocMem, OldAddTask, OldRemTask, OldUnLoadSeg;
 struct PPCBase* myPPCBase;
 struct ExecBase* mySysBase;
 
@@ -1413,6 +1413,7 @@ __entry struct PPCBase *LibInit(__reg("d0") struct PPCBase *ppcbase,
 
     OldLoadSeg    = SetFunction((struct Library*)DOSBase, _LVOLoadSeg,    (ULONG (*)())patchLoadSeg);
     OldNewLoadSeg = SetFunction((struct Library*)DOSBase, _LVONewLoadSeg, (ULONG (*)())patchNewLoadSeg);
+    OldUnLoadSeg  = SetFunction((struct Library*)DOSBase, _LVOUnLoadSeg,  (ULONG (*)())patchUnLoadSeg);   //17.17 (support68k.c)
     OldAddTask    = SetFunction((struct Library*)SysBase, _LVOAddTask,    (ULONG (*)())patchAddTask);
     OldRemTask    = SetFunction((struct Library*)SysBase, _LVORemTask,    (ULONG (*)())patchRemTask);
     OldAllocMem   = SetFunction((struct Library*)SysBase, _LVOAllocMem,   (ULONG (*)())patchAllocMem);

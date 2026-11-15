@@ -55,7 +55,17 @@ LIBFUNC68K struct Library* myOpen(__reg("a6") struct PPCBase* PowerPCBase)
     {
         struct ExecBase* SysBase = PowerPCBase->PPC_SysLib;
         myTask = SysBase->ThisTask;
-        myTask->tc_Flags |= TF_PPC;
+        /*
+         * 17.17: ONLY A PROCESS RUNNING A PROGRAM WITH PPC CODE IS TAGGED HERE (PPCSegTask,
+         * support68k.c), where 17.13b and 17.16 tagged every opener. A 68k program that
+         * opens the library to look at the card (SysSpeed, GetInfo, a launcher) no longer
+         * has every later AllocMem sent to PPC memory, which the 68k reads uncached. It is
+         * tagged when it runs PPC code (RunPPC) or asks for PPC memory (AllocVec32).
+         */
+        if (PPCSegTask(myTask))
+        {
+            myTask->tc_Flags |= TF_PPC;
+        }
         PowerPCBase->PPC_LibNode.lib_OpenCnt += 1;
         PowerPCBase->PPC_LibNode.lib_Flags &= (~LIBF_DELEXP);
     }

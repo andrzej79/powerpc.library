@@ -2,7 +2,7 @@ Short:		Driver for G3/G4 PCI cards
 Uploader:	dennisvdboon@gmail.com (Dennis Boon)
 Author:		dennisvdboon -> gmail (Dennis Boon)
 Type:		driver/other
-Version:	17.16
+Version:	17.17
 Architecture:	m68k-amigaos = 3.9
 Distribution:	Aminet
 URL:		https://github.com/Sakura-IT/SonnetAmiga
@@ -54,7 +54,8 @@ Restrictions:
 The PPC CPU on the PPC PCI card cannot DMA to Amiga memory. Any access to
 non-PPC/PCI memory by the PPC is very slow. The library is trying to avoid
 this by means of patching the AllocMem() and LoadSeg() functions. This way,
-PPC data and code is pushed to the memory residing on the PPC card itself.
+PPC data and code is pushed to the memory residing on the PPC card itself,
+while 68K code stays in Amiga memory (since 17.17).
 This is not 100% watertight and failure of these patches can lead to a DSI/ISI
 exception or very slow execution of the PPC program.
 
@@ -89,8 +90,18 @@ are:
   Default = 0.
 - DisL2Flush (0 or 1): Disables the full flush of the L2 cache. 
   Can speed up things if it doesn't crash. Default = 0.
-- DisHunkPatch (0 or 1): Disable automatic pushing first code hunk to FAST RAM.
-  Default = 0.
+- DisHunkPatch (0 or 1): Disable automatic pushing of 68K code hunks to FAST
+  RAM: every hunk of a program with PPC code then goes to PPC memory, unless the
+  file asks for FAST or CHIP. Default = 0.
+- LoadNormal (list): AmigaDOS patterns, separated by spaces or new lines,
+  matched without case against a program's file name. A matching program is
+  loaded by dos.library without any change. For example
+  "SetEnv SAVE sonnet/LoadNormal MyTool#?". Read at every load: no reboot.
+- LoadLegacy (list): the same, for programs that need 17.16's loader: every
+  hunk but the first in PPC memory when the program holds "powerpc.library",
+  "ppc.library", "AmigaAMP" or "RACE", and the loading task tagged. For a 68K
+  program that hands its own static data to PPC code it did not bring.
+  LoadLegacy "#?" gives 17.16's behaviour for every program.
 - SetCPUComm (0 or 1): If set will use another method of handling cross-cpu
   signalling. Default = 0.
 - NoZeroGuard (0 or 1): If set the kernel does not protect the zero page
@@ -170,6 +181,32 @@ It was a fun 9 year ride and thanks for your support! :-)
 
 
 -+-+-+-+-+-+-+-+-+-+-+-+-+
+
+What has changed since 17.16:
+
+Program loader (17.17):
+- The 68K reads PPC memory uncached, at about 5 MB/s on an A3000 with a
+  Firebird. 17.16 loaded every program that held "powerpc.library" (and three
+  other strings) with all hunks but the first in PPC memory, and left the task
+  that loaded it tagged for good: a 68K program that only looks at the card,
+  such as SysSpeed, ran its 68K tests from PPC memory, and a Shell or Workbench
+  that had loaded one kept giving PPC memory to what came after.
+- Hunks are now placed by what they hold. Before a program is loaded its hunks
+  are walked: 68K code goes to FAST RAM, PPC code to PPC memory, data and BSS
+  to PPC memory when the program has PPC code. PPC code is HUNK_PPC_CODE, or
+  a code or data hunk whose words are PPC instructions: vbcc's WarpOS
+  programs, SysSpeed's PPC test and Elf2Exe2's DLLs (MiniGL) carry PPC code in
+  ordinary hunks. A program without PPC code is loaded by dos.library unchanged.
+- The loading task is not tagged by a load. After a 68K program it is left
+  untagged, as before; after a program with PPC code it is left as it was. A
+  task is tagged when it opens the library while running a program with PPC
+  code, runs PPC code (RunPPC) or calls AllocVec32. A Shell is untagged again
+  when the command it ran is unloaded (UnLoadSeg is patched for this).
+- Nothing is written to the program's file any more (17.16 set protection
+  bits 16 and 17); the decisions are kept in memory. Bits set by older
+  versions are ignored.
+- Overlaid files and hunk types the walk does not know go to 17.16's loader.
+- LoadNormal and LoadLegacy (see the options) override the choice per program.
 
 What has changed since 17.15:
 

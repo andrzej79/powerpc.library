@@ -23,27 +23,27 @@
 #include <exec/initializers.h>
 
 #define VERSION     17
-#define REVISION    16
+#define REVISION    17
 
 #define LIBNAME "powerpc.library"
 #if defined(G4_DSSALL)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 dssall test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 dssall test\r\n"
 #elif defined(G4_AS_G3) && defined(G4_FORCE_VEC)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 as G3 VEC on test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 as G3 VEC on test\r\n"
 #elif defined(G4_AS_G3) && defined(G4_KEEP_ALTIVEC)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 as G3 AltiVec on test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 as G3 AltiVec on test\r\n"
 #elif defined(G4_AS_G3)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 as G3 test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 as G3 test\r\n"
 #elif defined(G4_FORCE_VEC) && defined(G4_GETINFO_G3)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 VEC on GetInfo G3 test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 VEC on GetInfo G3 test\r\n"
 #elif defined(G4_FORCE_VEC) && defined(G4_NO_VMX_COPY)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 VEC on no VMX copy test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 VEC on no VMX copy test\r\n"
 #elif defined(G4_FORCE_VEC)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 VEC on test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 VEC on test\r\n"
 #elif defined(G4_EARLY_VEC)
-#define VSTRING "$VER: powerpc.library 17.16 (29.10.26) G4 early VEC test\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (29.10.26) G4 early VEC test\r\n"
 #else
-#define VSTRING "$VER: powerpc.library 17.16 (14.11.26)\r\n"
+#define VSTRING "$VER: powerpc.library 17.17 (15.11.26)\r\n"
 #endif
 
 #define VERPCI      13

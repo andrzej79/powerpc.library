@@ -23,6 +23,7 @@
 #include <dos/dosextens.h>
 #include <utility/tagitem.h>
 #include <dos/dostags.h>
+#include <dos/var.h>
 #include <powerpc/powerpc.h>
 #include <proto/exec.h>
 #include <proto/dos.h>
@@ -35,7 +36,7 @@
 #include "libstructs.h"
 #include "Internals68k.h"
 
-extern APTR OldLoadSeg, OldNewLoadSeg, OldAllocMem, OldAddTask, OldRemTask;
+extern APTR OldLoadSeg, OldNewLoadSeg, OldAllocMem, OldAddTask, OldRemTask, OldUnLoadSeg;
 extern struct ExecBase* mySysBase;
 extern struct PPCBase* myPPCBase;
 
@@ -665,24 +666,828 @@ PATCH68K APTR patchAllocMem(__reg("d0") ULONG byteSize, __reg("d1") ULONG attrib
 
 /********************************************************************************************
 *
-*	Executable loading patches to load PPC (related) code to PPC memory
-*   (AUTODOCS ARE WRONG, called with d1, d2, d3 and not d1, a0, d0)
+*	Executable loading patches: where a program's hunks go (17.17)
+*   (AUTODOCS ARE WRONG, the InternalLoadSeg functions are called with d1, d2, d3 and not
+*   d1, a0, d0)
+*
+*   The 68k reads the card's memory uncached (libinit.c refuses to start otherwise, it is
+*   how the two CPUs stay coherent), so 68k code, a 68k stack or 68k buffers there run at
+*   bus speed: on an A3000 with a Firebird and a Harrier, about 5 MB/s. Up to 17.16 every
+*   program that held the string "powerpc.library", "ppc.library", "AmigaAMP" or "RACE"
+*   was loaded with every hunk but the first in PPC memory, and the process that loaded it
+*   was left tagged (TF_PPC) for good. A 68k program that only looks at the card (SysSpeed
+*   reports the CPU and has one PPC test) ran its 68k tests from PPC memory, and a Shell or
+*   Workbench that had loaded such a program kept giving PPC memory to everything after.
+*
+*   17.17 DIVERGES FROM 17.13b AND 17.16 here, on purpose:
+*
+*   1. Hunks are placed by what they hold. The file's hunks are walked before it is
+*      loaded (scanHunks: the header, each hunk's type, the words of each code hunk, the
+*      data skipped by Seek). The PPC never runs 68k code, so 68k code goes to Amiga
+*      memory (FAST); PPC code (HUNK_PPC_CODE, or a HUNK_CODE or HUNK_DATA whose words
+*      are PPC instructions: scanCode) goes to PPC memory; DATA and BSS go to PPC memory when the
+*      file has PPC code (its PPC code reads them), as before. A file without PPC code is
+*      loaded by dos.library unchanged: its 68k code calls powerpc.library at most, and memory it
+*      shares with the PPC comes from AllocVec32/AllocVecPPC, or from AllocMem once the
+*      process runs PPC code (RunPPC tags it, below).
+*   2. The loading process is not tagged by a load. After a program with PPC code it is
+*      left as it was found (17.16 left it tagged for good); after a 68k program it is left
+*      untagged, as 17.16 did, and dos.library's own load runs untagged (else the AllocMem
+*      patch puts the 68k program in PPC memory). A process is tagged when it opens
+*      this library while running a PPC program (myOpen asks PPCSegTask), or when it
+*      runs PPC code (RunPPC), or allocates with AllocVec32, as before. A Shell gets its
+*      state back when the command it ran is unloaded (patchUnLoadSeg).
+*   3. Nothing is written to the file. 17.16 set protection bits 16 (PPC) and 17 (not
+*      PPC) on every program it loaded, which changed users' files and, on read-only
+*      volumes, made every start load the whole program into PPC memory again to scan it.
+*      The decisions are kept in memory now (loadCache). Bits 16 and 17 already set by
+*      older versions are ignored.
+*   4. ENV:sonnet/LoadNormal and ENV:sonnet/LoadLegacy hold lists of AmigaDOS patterns
+*      (separated by spaces or new lines), matched without case against the file's name.
+*      LoadNormal: dos.library loads it unchanged. LoadLegacy: 17.16's loader, string
+*      scan and tagging included, for a program that hands static data to PPC code it
+*      did not bring itself. LoadLegacy "#?" gives 17.16's behaviour everywhere. Both are
+*      read at every load, so they work without a reboot.
+*
+*   A file this code does not understand (an overlay, resident library names in its
+*   header, a hunk type not listed in scanHunks) goes to 17.16's loader, minus the file
+*   writes. ENV:sonnet/DisHunkPatch keeps its meaning: no hunk is moved to FAST by this
+*   library. Cybermand and CyberPi keep their exception (no hunk moved).
 *
 *********************************************************************************************/
+
+#define LS_NORMAL       0       //dos.library loads it unchanged
+#define LS_EHF          1       //placed by hunk type
+#define LS_LEGACY       2       //17.16's loader, string scan included
+#define LS_KEEP         3       //cache only: 17.16's loader found a string, load and keep without the scan
+
+#define LP_NONE         0xFF    //lp_Top: this hunk's size word is not touched
+
+#define SCAN_BUF        2048
+#define SCAN_MAXHUNKS   4096
+#define SCAN_MAXLONGS   0x01000000  //a count above 64 MB is not a hunk file this code reads
+
+#define ENVLIST_MAX     512
+
+#ifndef HUNK_PPC_CODE
+#define HUNK_PPC_CODE   1257    //EHF (vlink amigahunks.h)
+#endif
+#ifndef HUNK_RELRELOC26
+#define HUNK_RELRELOC26 1260    //EHF, long format
+#endif
+
+/* one hunk of the file being loaded: where its size word is, the word, its type, and the
+   two top bits (MEMF: 1 CHIP, 2 FAST) ReadFunc writes into it */
+struct LoadPatch
+{
+    ULONG lp_Offset;
+    ULONG lp_Size;
+    ULONG lp_Type;
+    ULONG lp_Top;
+};
+
+/* a load in progress, found by ReadFunc through its file handle (InternalLoadSeg passes
+   nothing else). Claimed and freed under Forbid; one per loading task. */
+struct LoadCtx
+{
+    BPTR              lc_File;
+    LONG              lc_Mode;
+    ULONG             lc_Pos;       //bytes read so far
+    ULONG             lc_Next;      //first patch not yet behind lc_Pos
+    ULONG             lc_Count;
+    struct LoadPatch* lc_Patches;
+};
+
+#define LOADCTX_MAX     8
+static struct LoadCtx loadCtx[LOADCTX_MAX];
+
+/* what was decided for a file, by its disk key, size, date and name */
+struct LoadCache
+{
+    ULONG c_Key;
+    ULONG c_Size;
+    ULONG c_Days;
+    ULONG c_Minute;
+    ULONG c_Tick;
+    ULONG c_Name;
+    ULONG c_Mode;
+    ULONG c_Used;
+};
+
+#define LOADCACHE_MAX   32
+static struct LoadCache loadCache[LOADCACHE_MAX];
+static ULONG loadCacheNext;
+
+/* a seglist this library loaded: whether it holds PPC code (myOpen), and the TF_PPC state
+   of the process that loaded it, given back when a Shell unloads its command */
+struct SegTrack
+{
+    BPTR         st_Seg;
+    struct Task* st_Task;
+    ULONG        st_Had;
+    ULONG        st_PPC;
+    ULONG        st_Age;
+};
+
+#define SEGTRACK_MAX    32
+static struct SegTrack segTrack[SEGTRACK_MAX];
+static ULONG segTrackAge;
+
+/********************************************************************************************/
+
+/* Amiga memory through exec's own AllocMem: the patch above could send it to PPC memory */
+static APTR plainAlloc(ULONG size, struct ExecBase* SysBase)
+{
+    APTR (*AllocMem_ptr)(__reg("d0") ULONG, __reg("d1") ULONG, __reg("a6") struct ExecBase*) = OldAllocMem;
+
+    return ((*AllocMem_ptr)(size, MEMF_PUBLIC | MEMF_CLEAR, SysBase));
+}
+
+static ULONG nameHash(CONST_STRPTR name)
+{
+    ULONG hash = 5381;
+    UBYTE c;
+
+    while (c = *name++)
+    {
+        if ((c >= 'a') && (c <= 'z'))
+        {
+            c -= 0x20;
+        }
+        hash = (hash * 33) ^ c;
+    }
+    return hash;
+}
+
+static LONG cacheFind(struct LoadCache* key, struct ExecBase* SysBase)
+{
+    LONG mode = -1;
+
+    Forbid();
+
+    for (int i = 0; i < LOADCACHE_MAX; i++)
+    {
+        struct LoadCache* c = &loadCache[i];
+
+        if ((c->c_Used) && (c->c_Key == key->c_Key) && (c->c_Size == key->c_Size) && (c->c_Days == key->c_Days)
+            && (c->c_Minute == key->c_Minute) && (c->c_Tick == key->c_Tick) && (c->c_Name == key->c_Name))
+        {
+            mode = c->c_Mode;
+            break;
+        }
+    }
+
+    Permit();
+
+    return mode;
+}
+
+static void cacheAdd(struct LoadCache* key, ULONG mode, struct ExecBase* SysBase)
+{
+    Forbid();
+
+    struct LoadCache* c = &loadCache[loadCacheNext];
+
+    loadCacheNext = (loadCacheNext + 1) % LOADCACHE_MAX;
+    *c = *key;
+    c->c_Mode = mode;
+    c->c_Used = 1;
+
+    Permit();
+}
+
+/********************************************************************************************/
+
+static struct LoadCtx* ctxClaim(BPTR file, LONG mode, struct LoadPatch* patches, ULONG count, struct ExecBase* SysBase)
+{
+    struct LoadCtx* ctx = NULL;
+
+    Forbid();
+
+    for (int i = 0; i < LOADCTX_MAX; i++)
+    {
+        if (!(loadCtx[i].lc_File))
+        {
+            ctx = &loadCtx[i];
+            ctx->lc_File    = file;
+            ctx->lc_Mode    = mode;
+            ctx->lc_Pos     = 0;
+            ctx->lc_Next    = 0;
+            ctx->lc_Count   = count;
+            ctx->lc_Patches = patches;
+            break;
+        }
+    }
+
+    Permit();
+
+    return ctx;
+}
+
+static void ctxRelease(struct LoadCtx* ctx, struct ExecBase* SysBase)
+{
+    if (ctx)
+    {
+        Forbid();
+        ctx->lc_File = 0;
+        Permit();
+    }
+}
+
+static struct LoadCtx* ctxFind(BPTR file)
+{
+    for (int i = 0; i < LOADCTX_MAX; i++)
+    {
+        if (loadCtx[i].lc_File == file)
+        {
+            return &loadCtx[i];
+        }
+    }
+    return NULL;
+}
+
+/********************************************************************************************/
+
+static void segTrackAdd(BPTR seg, struct Task* task, ULONG had, ULONG ppc, struct ExecBase* SysBase)
+{
+    Forbid();
+
+    struct SegTrack* slot = &segTrack[0];
+
+    for (int i = 0; i < SEGTRACK_MAX; i++)
+    {
+        if (!(segTrack[i].st_Seg))
+        {
+            slot = &segTrack[i];
+            break;
+        }
+        if (segTrack[i].st_Age < slot->st_Age)
+        {
+            slot = &segTrack[i];
+        }
+    }
+    slot->st_Seg  = seg;
+    slot->st_Task = task;
+    slot->st_Had  = had;
+    slot->st_PPC  = ppc;
+    slot->st_Age  = ++segTrackAge;
+
+    Permit();
+}
+
+static BOOL isPPCSeg(BPTR seg)
+{
+    if (seg)
+    {
+        for (int i = 0; i < SEGTRACK_MAX; i++)
+        {
+            if ((segTrack[i].st_Seg == seg) && (segTrack[i].st_PPC))
+            {
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+/*
+ * Is this task running a program with PPC code (or one loaded by 17.16's loader)? Asked by
+ * myOpen. A plain task (not a process) cannot have been loaded: it is tagged as before.
+ * A Shell command's seglist is cli_Module; a process started with NP_Seglist (Workbench)
+ * has it in pr_SegList[3].
+ */
+BOOL PPCSegTask(struct Task* task)
+{
+    struct ExecBase* SysBase = myPPCBase->PPC_SysLib;
+    struct Process* proc = (struct Process*)task;
+    BOOL found;
+    BPTR seg1 = 0;
+    BPTR seg2 = 0;
+
+    if (task->tc_Node.ln_Type != NT_PROCESS)
+    {
+        return TRUE;
+    }
+
+    struct CommandLineInterface* cli = (struct CommandLineInterface*)((ULONG)(proc->pr_CLI << 2));
+
+    if (cli)
+    {
+        seg1 = cli->cli_Module;
+    }
+    if (proc->pr_SegList)
+    {
+        LONG* segArray = (LONG*)((ULONG)(proc->pr_SegList << 2));
+
+        if (segArray[0] >= 3)
+        {
+            seg2 = segArray[3];
+        }
+    }
+
+    Forbid();
+    found = isPPCSeg(seg1) || isPPCSeg(seg2);
+    Permit();
+
+    return found;
+}
+
+/********************************************************************************************/
+
+/* is a pattern in ENV:<var> (a list of AmigaDOS patterns) matching this file name? */
+static BOOL envMatch(CONST_STRPTR var, CONST_STRPTR file, struct ExecBase* SysBase, struct DosLibrary* DOSBase)
+{
+    BOOL hit = FALSE;
+    UBYTE* buffer;
+    LONG len;
+
+    if (!(buffer = (UBYTE*)plainAlloc((3 * ENVLIST_MAX) + 2, SysBase)))
+    {
+        return FALSE;
+    }
+
+    len = GetVar(var, (STRPTR)buffer, ENVLIST_MAX, GVF_GLOBAL_ONLY | GVF_BINARY_VAR);
+
+    if (len > 0)
+    {
+        UBYTE* token = buffer + ENVLIST_MAX;    //2 * ENVLIST_MAX + 2 for ParsePatternNoCase
+        UBYTE* p = buffer;
+
+        buffer[(len < ENVLIST_MAX) ? len : (ENVLIST_MAX - 1)] = 0;
+
+        while ((*p) && (!(hit)))
+        {
+            UBYTE* start;
+            UBYTE save;
+
+            while ((*p == ' ') || (*p == '\t') || (*p == '\n') || (*p == '\r'))
+            {
+                p++;
+            }
+            if (!(*p))
+            {
+                break;
+            }
+            start = p;
+            while ((*p) && (*p != ' ') && (*p != '\t') && (*p != '\n') && (*p != '\r'))
+            {
+                p++;
+            }
+            save = *p;
+            *p = 0;
+            if (ParsePatternNoCase((STRPTR)start, (STRPTR)token, (2 * ENVLIST_MAX) + 2) >= 0)
+            {
+                hit = MatchPatternNoCase((STRPTR)token, (STRPTR)file);
+            }
+            *p = save;
+        }
+    }
+
+    FreeMem(buffer, (3 * ENVLIST_MAX) + 2);
+
+    return hit;
+}
+
+/********************************************************************************************/
+
+/* the hunk walk reads through a buffer of its own and skips bodies with Seek */
+struct HunkScan
+{
+    BPTR   hs_File;
+    UBYTE* hs_Buf;
+    LONG   hs_Len;
+    LONG   hs_At;
+    ULONG  hs_Start;    //file offset of hs_Buf[0]
+    LONG   hs_Bad;
+};
+
+static ULONG scanByte(struct HunkScan* s, struct DosLibrary* DOSBase)
+{
+    if (s->hs_Bad)
+    {
+        return 0;
+    }
+    if (s->hs_At >= s->hs_Len)
+    {
+        s->hs_Start += s->hs_Len;
+        s->hs_At     = 0;
+        s->hs_Len    = Read(s->hs_File, s->hs_Buf, SCAN_BUF);
+        if (s->hs_Len <= 0)
+        {
+            s->hs_Len = 0;
+            s->hs_Bad = 1;
+            return 0;
+        }
+    }
+    return s->hs_Buf[s->hs_At++];
+}
+
+static ULONG scanWord(struct HunkScan* s, struct DosLibrary* DOSBase)
+{
+    ULONG value = scanByte(s, DOSBase) << 8;
+
+    return (value | scanByte(s, DOSBase));
+}
+
+static ULONG scanLong(struct HunkScan* s, struct DosLibrary* DOSBase)
+{
+    ULONG value = scanWord(s, DOSBase) << 16;
+
+    return (value | scanWord(s, DOSBase));
+}
+
+static ULONG scanPos(struct HunkScan* s)
+{
+    return (s->hs_Start + s->hs_At);
+}
+
+static void scanSkip(struct HunkScan* s, ULONG bytes, struct DosLibrary* DOSBase)
+{
+    if (s->hs_Bad)
+    {
+        return;
+    }
+    if (bytes <= (ULONG)(s->hs_Len - s->hs_At))
+    {
+        s->hs_At += bytes;
+        return;
+    }
+
+    ULONG target = scanPos(s) + bytes;
+
+    if (Seek(s->hs_File, target, OFFSET_BEGINNING) < 0)
+    {
+        s->hs_Bad = 1;
+        return;
+    }
+    s->hs_Start = target;
+    s->hs_Len   = 0;
+    s->hs_At    = 0;
+}
+
+static ULONG scanCount(struct HunkScan* s, struct DosLibrary* DOSBase)
+{
+    ULONG count = scanLong(s, DOSBase);
+
+    if (count > SCAN_MAXLONGS)
+    {
+        s->hs_Bad = 1;
+        return 0;
+    }
+    return count;
+}
+
+/*
+ * PPC CODE IS TOLD BY ITS CONTENT, NOT ONLY BY ITS TYPE. vlink writes HUNK_PPC_CODE only
+ * for sections it has marked as PPC; WarpOS programs built by vbcc carry their PPC code
+ * in plain HUNK_CODE (WarpQuake2PPC, SysSpeed's PPC test hunk, rtgmaster). So a code
+ * hunk's words are counted: aligned blr, mflr r0, mtlr r0 and stwu r1,-n(r1) for PPC;
+ * rts, link a5, unlk a5, movem.l to and from the stack (as halfwords) for 68k. A hunk is
+ * PPC code with PPC marks and no 68k ones, or with at least one PPC mark for every eight
+ * 68k ones. The rule leans to PPC on purpose: 68k code in PPC memory only runs slowly
+ * (what 17.16 did to every hunk but the first), PPC code in Amiga memory does not run.
+ * Data hunks are counted too, with a higher bar (four PPC marks): Elf2Exe2, which makes
+ * MiniGL's minigl_ppc.dll, puts the PPC code in HUNK_DATA (379,736 bytes, 3,777 marks).
+ * Checked over 5,536 hunk files of a WinUAE system (2026-11-15): no 68k program is taken
+ * for PPC code (no 68k data hunk has more than one PPC mark); the PPC hunks found are
+ * SysSpeed's, rtgmaster's and WarpUp tools'.
+ */
+static void scanCode(struct HunkScan* s, ULONG longs, ULONG* ppcOut, ULONG* m68kOut, struct DosLibrary* DOSBase)
+{
+    ULONG ppc = 0;
+    ULONG m68k = 0;
+
+    while ((longs) && (!(s->hs_Bad)))
+    {
+        ULONG word;
+
+        if ((s->hs_Len - s->hs_At) >= 4)
+        {
+            UBYTE* b = &s->hs_Buf[s->hs_At];
+
+            word = ((ULONG)b[0] << 24) | ((ULONG)b[1] << 16) | ((ULONG)b[2] << 8) | b[3];
+            s->hs_At += 4;
+        }
+        else
+        {
+            word = scanLong(s, DOSBase);
+        }
+
+        if ((word == 0x4E800020) || (word == 0x7C0802A6) || (word == 0x7C0803A6) || ((word & 0xFFFF8000) == 0x94218000))
+        {
+            ppc += 1;
+        }
+
+        for (int half = 0; half < 2; half++)
+        {
+            ULONG h = half ? (word & 0xFFFF) : (word >> 16);
+
+            if ((h == 0x4E75) || (h == 0x4E55) || (h == 0x4E5D) || (h == 0x48E7) || (h == 0x4CDF))
+            {
+                m68k += 1;
+            }
+        }
+        longs -= 1;
+    }
+    *ppcOut  = ppc;
+    *m68kOut = m68k;
+}
+
+/*
+ * Walks a load file from its start: LS_NORMAL when it has no PPC code, LS_EHF with the
+ * patch list made when it has, LS_LEGACY when it is not a file this walk understands.
+ * The handle is left anywhere; the caller seeks back to the start.
+ */
+static LONG scanHunks(BPTR file, struct LoadPatch** patchesOut, ULONG* countOut, ULONG* bytesOut,
+                      struct ExecBase* SysBase, struct DosLibrary* DOSBase)
+{
+    struct HunkScan scan;
+    struct HunkScan* s = &scan;
+    struct LoadPatch* patches = NULL;
+    ULONG count = 0;
+    ULONG bytes = 0;
+    ULONG hasPPC = 0;
+    ULONG i;
+    LONG result = LS_LEGACY;
+
+    *patchesOut = NULL;
+    *countOut   = 0;
+    *bytesOut   = 0;
+
+    s->hs_File  = file;
+    s->hs_Len   = 0;
+    s->hs_At    = 0;
+    s->hs_Start = 0;
+    s->hs_Bad   = 0;
+
+    if (!(s->hs_Buf = (UBYTE*)plainAlloc(SCAN_BUF, SysBase)))
+    {
+        return LS_LEGACY;
+    }
+
+    if ((scanLong(s, DOSBase) != HUNK_HEADER) || (scanLong(s, DOSBase) != 0))   //no resident library names in a program
+    {
+        goto done;
+    }
+
+    count = scanLong(s, DOSBase);
+
+    if ((scanLong(s, DOSBase) != 0) || (scanLong(s, DOSBase) != (count - 1)) || (!(count)) || (count > SCAN_MAXHUNKS)
+        || (s->hs_Bad))
+    {
+        goto done;
+    }
+
+    bytes = count * sizeof(struct LoadPatch);
+
+    if (!(patches = (struct LoadPatch*)plainAlloc(bytes, SysBase)))
+    {
+        goto done;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        patches[i].lp_Offset = scanPos(s);
+        patches[i].lp_Size   = scanLong(s, DOSBase);
+        patches[i].lp_Top    = LP_NONE;
+        if ((patches[i].lp_Size & 0xC0000000) == 0xC0000000)
+        {
+            scanLong(s, DOSBase);                   //extended memory attributes follow
+        }
+    }
+
+    i = 0;
+
+    while ((i < count) && (!(s->hs_Bad)))
+    {
+        ULONG type = scanLong(s, DOSBase) & 0x3FFFFFFF;
+        ULONG n;
+
+        if (s->hs_Bad)
+        {
+            break;
+        }
+
+        switch (type)
+        {
+            case HUNK_NAME:
+            case HUNK_DEBUG:
+            {
+                n = scanCount(s, DOSBase);
+                scanSkip(s, n * 4, DOSBase);
+                break;
+            }
+            case HUNK_CODE:
+            case HUNK_PPC_CODE:
+            {
+                ULONG ppcMarks = 0;
+                ULONG m68kMarks = 0;
+
+                n = scanCount(s, DOSBase);
+                scanCode(s, n, &ppcMarks, &m68kMarks, DOSBase);
+                if ((type == HUNK_PPC_CODE) || ((ppcMarks) && (!(m68kMarks))) || ((ppcMarks >= 2) && ((ppcMarks * 8) >= m68kMarks)))
+                {
+                    patches[i].lp_Type = HUNK_PPC_CODE;
+                    hasPPC = 1;
+                }
+                else
+                {
+                    patches[i].lp_Type = HUNK_CODE;
+                }
+                break;
+            }
+            case HUNK_DATA:
+            {
+                ULONG ppcMarks = 0;
+                ULONG m68kMarks = 0;
+
+                n = scanCount(s, DOSBase);
+                scanCode(s, n, &ppcMarks, &m68kMarks, DOSBase);
+                if ((ppcMarks >= 4) && ((ppcMarks * 8) >= m68kMarks))
+                {
+                    patches[i].lp_Type = HUNK_PPC_CODE;     //PPC code in a data hunk (Elf2Exe2's DLLs)
+                    hasPPC = 1;
+                }
+                else
+                {
+                    patches[i].lp_Type = type;
+                }
+                break;
+            }
+            case HUNK_BSS:
+            {
+                scanLong(s, DOSBase);
+                patches[i].lp_Type = type;
+                break;
+            }
+            case HUNK_RELOC32:
+            case HUNK_RELOC16:
+            case HUNK_RELOC8:
+            case HUNK_DREL16:
+            case HUNK_DREL8:
+            case HUNK_RELRELOC26:
+            {
+                while ((n = scanCount(s, DOSBase)) && (!(s->hs_Bad)))
+                {
+                    scanSkip(s, 4 + (n * 4), DOSBase);
+                }
+                break;
+            }
+            case HUNK_RELOC32SHORT:
+            case HUNK_DREL32:                       //in a load file the short format (doshunks.h)
+            {
+                while ((n = scanWord(s, DOSBase)) && (!(s->hs_Bad)))
+                {
+                    scanSkip(s, 2 + (n * 2), DOSBase);
+                }
+                if (scanPos(s) & 2)
+                {
+                    scanSkip(s, 2, DOSBase);
+                }
+                break;
+            }
+            case HUNK_SYMBOL:
+            {
+                while ((n = scanLong(s, DOSBase)) && (!(s->hs_Bad)))
+                {
+                    scanSkip(s, ((n & 0x00FFFFFF) * 4) + 4, DOSBase);
+                }
+                break;
+            }
+            case HUNK_END:
+            {
+                if (!(patches[i].lp_Type))
+                {
+                    s->hs_Bad = 1;
+                }
+                i++;
+                break;
+            }
+            default:
+            {
+                s->hs_Bad = 1;                      //an overlay, a break, a type not known here
+                break;
+            }
+        }
+    }
+
+    if ((s->hs_Bad) || (i < count))
+    {
+        goto done;
+    }
+
+    if ((scanLong(s, DOSBase) & 0x3FFFFFFF) == HUNK_OVERLAY)
+    {
+        if (!(s->hs_Bad))
+        {
+            goto done;                              //the root of an overlaid file: 17.16's loader
+        }
+    }
+
+    if (!(hasPPC))
+    {
+        result = LS_NORMAL;
+        goto done;
+    }
+
+    result = LS_EHF;
+
+    BOOL noPatch = (myPPCBase->PPC_Flags & LIB_FLAGPPC_DHP) ? TRUE : FALSE;
+
+    if (count >= 2)
+    {
+        if (((patches[0].lp_Size == 0x71E) && (patches[1].lp_Size == 0x710)) ||    //Cybermand
+            ((patches[0].lp_Size == 0x84E) && (patches[1].lp_Size == 0xEE)))       //CyberPi
+        {
+            noPatch = TRUE;
+        }
+    }
+
+    if (!(noPatch))
+    {
+        for (i = 0; i < count; i++)
+        {
+            ULONG top = patches[i].lp_Size >> 30;
+
+            if (top == 3)
+            {
+                continue;                           //extended attributes: as the file asks
+            }
+            if ((patches[i].lp_Type == HUNK_CODE) && (top != 1))
+            {
+                patches[i].lp_Top = 2;              //68k code: FAST (a CHIP request is kept)
+            }
+            else if ((patches[i].lp_Type == HUNK_PPC_CODE) && (top != 0))
+            {
+                patches[i].lp_Top = 0;              //PPC code: never Amiga memory
+            }
+        }
+    }
+
+done:
+    FreeMem(s->hs_Buf, SCAN_BUF);
+
+    if ((result == LS_EHF) && (patches))
+    {
+        *patchesOut = patches;
+        *countOut   = count;
+        *bytesOut   = bytes;
+    }
+    else if (patches)
+    {
+        FreeMem(patches, bytes);
+    }
+    return result;
+}
+
+/********************************************************************************************/
 
 LONG ReadFunc(__reg("d1") BPTR readhandle, __reg("d2") APTR buffer, __reg("d3") LONG length, __reg("a6") struct DosLibrary* DOSBase)
 {
     LONG result;
 
     ULONG* myBuffer = (ULONG*)buffer;
+    struct LoadCtx* ctx = ctxFind(readhandle);
 
     result = Read(readhandle, buffer, length);
+
+    if ((ctx) && (ctx->lc_Mode == LS_EHF))
+    {
+        /*
+         * The size words of the hunks to move, by their offset in the file: only the top
+         * byte changes (bits 31 and 30, FAST and CHIP), so a word split between two reads
+         * needs no care.
+         */
+        if (result > 0)
+        {
+            ULONG start = ctx->lc_Pos;
+            ULONG end   = start + result;
+            struct LoadPatch* patches = ctx->lc_Patches;
+
+            while ((ctx->lc_Next < ctx->lc_Count) && (patches[ctx->lc_Next].lp_Offset < start))
+            {
+                ctx->lc_Next += 1;
+            }
+            for (ULONG n = ctx->lc_Next; (n < ctx->lc_Count) && (patches[n].lp_Offset < end); n++)
+            {
+                if (patches[n].lp_Top != LP_NONE)
+                {
+                    UBYTE* top = (UBYTE*)buffer + (patches[n].lp_Offset - start);
+
+                    *top = (*top & 0x3F) | (UBYTE)(patches[n].lp_Top << 6);
+                }
+            }
+            ctx->lc_Pos = end;
+        }
+        return result;
+    }
 
     if (!(myPPCBase->PPC_Flags & LIB_FLAGPPC_DHP))
     {
         if ((myBuffer[0] == HUNK_HEADER) && (myBuffer[1] == NULL) && (myBuffer[3] == NULL) && (myBuffer[2] - myBuffer[4] - 1 == NULL))
         {
             /*
+             * 17.16's rule, for its loader (LS_LEGACY): the first hunk to FAST.
              * THE TWO EXCEPTIONS 17.13b HAS (powerpc.s:3506-3522): programs
              * whose first hunk is not marked FAST, so they load entirely into
              * PPC memory. 17.15 added a third, the hunk sizes of one build of
@@ -741,7 +1546,14 @@ void FreeFunc(__reg("a1") APTR memory, __reg("d0") ULONG size, __reg("a6") struc
 
 /********************************************************************************************/
 
-BPTR myLoader(STRPTR name) // -1 = try normal 0 = fail
+/*
+ * 17.16's loader for one open file (LS_LEGACY, LS_KEEP): every hunk but the first in PPC
+ * memory, kept when a string marks it as PPC related. Returns the seglist, or -1 for
+ * dos.library to load the file (the handle is closed either way). Sets *keptOut when the
+ * load is kept; TF_PPC is then left set, as 17.16 left it.
+ */
+static BPTR legacyLoad(STRPTR name, BPTR myLock, LONG mode, struct LoadCache* key, BOOL useCache, ULONG* keptOut,
+                       struct ExecBase* SysBase, struct DosLibrary* DOSBase)
 {
     struct FuncTable
     {
@@ -752,168 +1564,345 @@ BPTR myLoader(STRPTR name) // -1 = try normal 0 = fail
     };
 
     struct FuncTable myFuncTable;
-    struct ExecBase* SysBase   = myPPCBase->PPC_SysLib;
-    struct DosLibrary* DOSBase = myPPCBase->PPC_DosLib;
-    BPTR myLock, mySeglist;
-    struct FileInfoBlock* myFIB;
-    LONG myProt;
+    struct LoadCtx* ctx;
+    BPTR mySeglist;
 
-    if (*((ULONG*)SysBase->ThisTask->tc_Node.ln_Name) == 0x44656649)    //DefI(cons)
+    *keptOut = 0;
+
+    ctx = ctxClaim(myLock, LS_LEGACY, NULL, 0, SysBase);
+
+    SysBase->ThisTask->tc_Flags |= TF_PPC;
+    myFuncTable.ReadFunc  = (APTR)&ReadFunc;
+    myFuncTable.AllocFunc = (APTR)&AllocFunc;
+    myFuncTable.FreeFunc  = (APTR)&FreeFunc;
+    myFuncTable.Stack     = 0;
+    mySeglist = InternalLoadSeg(myLock, NULL, (LONG*)&myFuncTable, (LONG*)&myFuncTable.Stack);
+
+    ctxRelease(ctx, SysBase);
+
+    if (mySeglist < 0)
     {
+        /*
+         * AN OVERLAID FILE (P4, REVIEW-LIB.md, 10 Nov 2026).
+         * InternalLoadSeg returns -(seglist) and keeps the file
+         * open for the overlay manager; unloading the seglist is
+         * what closes it (NDK 3.9 dos.doc:2803-2804, :2845-2846,
+         * :5423-5424). So no Close here, and it is the seglist
+         * that is unloaded, not !mySeglist (which is 0), as in
+         * 17.13b (powerpc.s:3414-3416, :3469).
+         */
+        UnLoadSeg(-mySeglist);
+        if (useCache)
+        {
+            cacheAdd(key, LS_NORMAL, SysBase);
+        }
         return -1;
     }
 
-    SysBase->ThisTask->tc_Flags &= ~TF_PPC;
+    Close(myLock);
 
-    if (myLock = Open(name, MODE_OLDFILE))
+    if (!(mySeglist))
     {
-        
-        if (myFIB = (struct FileInfoBlock*)AllocDosObject(DOS_FIB, NULL))
+        return NULL;
+    }
+
+    if (mode == LS_KEEP)
+    {
+        *keptOut = 1;
+        return mySeglist;
+    }
+
+    BPTR testSeglist = mySeglist;
+
+    while (testSeglist)
+    {
+        ULONG curPointer = (ULONG)testSeglist << 2;
+        UBYTE* mySegData = (UBYTE*)(curPointer + 4);
+        LONG mySegSize   = (*((ULONG*)(curPointer - 4)));
+        testSeglist = (*((ULONG*)(curPointer)));
+
+        for (int i=mySegSize; i >= 0; i--)
         {
-            if (ExamineFH(myLock, myFIB))
+            ULONG* myLongData = (ULONG*)mySegData;
+            BOOL found = FALSE;
+
+            if (myLongData[0] == 0x52414345)            // "RACE"
             {
-                myProt = myFIB->fib_Protection;
-                FreeDosObject(DOS_FIB, (APTR)myFIB);
-                if (myProt & 0x20000)
-                {                    
-                    Close(myLock);
-                    return -1;
+                found = TRUE;
+            }
+            for (int i=0; (i<20) && (!(found)); i++)
+            {
+                if (mySegData[i] == powerlib[i])
+                {
+                    if (powerlib[i+1] == 0)
+                    {
+                        found = TRUE;
+                    }
                 }
                 else
                 {
-                    SysBase->ThisTask->tc_Flags |= TF_PPC;
-                    myFuncTable.ReadFunc  = (APTR)&ReadFunc;
-                    myFuncTable.AllocFunc = (APTR)&AllocFunc;
-                    myFuncTable.FreeFunc  = (APTR)&FreeFunc;
-                    myFuncTable.Stack     = 0;
-                    mySeglist = InternalLoadSeg(myLock, NULL, (LONG*)&myFuncTable, (LONG*)&myFuncTable.Stack);
-                    if (mySeglist < 0)
-                    {
-                        /*
-                         * AN OVERLAID FILE (P4, REVIEW-LIB.md, 10 Nov 2026).
-                         * InternalLoadSeg returns -(seglist) and keeps the file
-                         * open for the overlay manager; unloading the seglist is
-                         * what closes it (NDK 3.9 dos.doc:2803-2804, :2845-2846,
-                         * :5423-5424). So no Close here, and it is the seglist
-                         * that is unloaded, not !mySeglist (which is 0), as in
-                         * 17.13b (powerpc.s:3414-3416, :3469).
-                         */
-                        UnLoadSeg(-mySeglist);
-                        SetProtection(name, myProt | 0x20000);
-                        SysBase->ThisTask->tc_Flags &= ~TF_PPC;
-                        return -1;
-                    }
-                    Close(myLock);
-                    if (!(mySeglist))
-                    {
-                        return NULL;
-                    }
-                    else
-                    {
-                        if (myProt & 0x10000)
-                        {
-                            return mySeglist;
-                        }
-                        BPTR testSeglist = mySeglist;
-                        while (testSeglist)
-                        {
-                            ULONG curPointer = (ULONG)testSeglist << 2;
-                            UBYTE* mySegData = (UBYTE*)(curPointer + 4);
-                            LONG mySegSize   = (*((ULONG*)(curPointer - 4)));
-                            testSeglist = (*((ULONG*)(curPointer)));
-
-                            for (int i=mySegSize; i >= 0; i--)
-                            {
-                                ULONG* myLongData = (ULONG*)mySegData;
-                                if (myLongData[0] == 0x52414345)            // "RACE"
-                                {
-                                    SetProtection(name, myProt | 0x10000);
-                                    return mySeglist;
-                                }
-                                for (int i=0; i<20; i++)
-                                {
-                                    if (mySegData[i] == powerlib[i])
-                                    {
-                                        if (powerlib[i+1] == 0)
-                                        {
-                                            SetProtection(name, myProt | 0x10000);
-                                            return mySeglist;
-                                        }
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                for (int i=0; i<20; i++)
-                                {
-                                    if (mySegData[i] == ppclib[i])
-                                    {
-                                        if (ppclib[i+1] == 0)
-                                        {
-                                            SetProtection(name, myProt | 0x10000);
-                                            return mySeglist;
-                                        }
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                for (int i=0; i<20; i++)
-                                {
-                                    if (mySegData[i] == ampname[i])
-                                    {
-                                        if (ampname[i+1] == 0)
-                                        {
-                                            SetProtection(name, myProt | 0x10000);
-                                            return mySeglist;
-                                        }
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                mySegData += 1;
-                            }
-                        }
-                        UnLoadSeg(mySeglist);
-                        SetProtection(name, myProt | 0x20000);
-                        SysBase->ThisTask->tc_Flags &= ~TF_PPC;
-                    }
+                    break;
                 }
             }
-            else
+            for (int i=0; (i<20) && (!(found)); i++)
             {
-                /* ExamineFH failed (a handler that cannot examine a handle): free the FIB and the handle (P4) */
-                FreeDosObject(DOS_FIB, (APTR)myFIB);
-                Close(myLock);
+                if (mySegData[i] == ppclib[i])
+                {
+                    if (ppclib[i+1] == 0)
+                    {
+                        found = TRUE;
+                    }
+                }
+                else
+                {
+                    break;
+                }
             }
+            for (int i=0; (i<20) && (!(found)); i++)
+            {
+                if (mySegData[i] == ampname[i])
+                {
+                    if (ampname[i+1] == 0)
+                    {
+                        found = TRUE;
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            if (found)
+            {
+                if (useCache)
+                {
+                    cacheAdd(key, LS_KEEP, SysBase);
+                }
+                *keptOut = 1;
+                return mySeglist;
+            }
+            mySegData += 1;
         }
-        else
-        {
-            /* AllocDosObject failed: 17.13b closes the handle here too (powerpc.s:3369, :3406) (P4) */
-            Close(myLock);
-        }
+    }
+
+    UnLoadSeg(mySeglist);
+    if (useCache)
+    {
+        cacheAdd(key, LS_NORMAL, SysBase);
     }
     return -1;
 }
 
 /********************************************************************************************/
 
+/*
+ * Returns the seglist, 0 for a failure, or -1 for dos.library to load the file. TF_PPC is
+ * left CLEAR on every return but a kept 17.16 load (*keepOut): dos.library's own load must
+ * run untagged, or the AllocMem patch sends its hunks to PPC memory -- a 68k library that
+ * ramlib loads after something tagged ramlib went to the card's memory (MiniGL's 68k
+ * library: Quake II GL 19.8 -> 21.2 ms a frame, found 2026-11-15). After a program with
+ * PPC code the caller gives the task its state back (patchLoadSeg); after a 68k program
+ * it stays untagged, as 17.16 left it, so that ramlib's InitResident (MakeLibrary: the
+ * library's base and jump table) runs untagged too.
+ */
+BPTR myLoader(STRPTR name, ULONG* ppcOut, ULONG* keepOut) // -1 = try normal 0 = fail
+{
+    struct FuncTable
+    {
+        APTR ReadFunc;
+        APTR AllocFunc;
+        APTR FreeFunc;
+        ULONG Stack;
+    };
+
+    struct ExecBase* SysBase   = myPPCBase->PPC_SysLib;
+    struct DosLibrary* DOSBase = myPPCBase->PPC_DosLib;
+    struct Task* myTask        = SysBase->ThisTask;
+    struct FileInfoBlock* myFIB;
+    struct LoadCache key;
+    BPTR myLock;
+    BPTR result = -1;
+    BOOL useCache = FALSE;
+    LONG mode;
+
+    *ppcOut  = 0;
+    *keepOut = 0;
+
+    if ((myTask->tc_Node.ln_Name) && (*((ULONG*)myTask->tc_Node.ln_Name) == 0x44656649))    //DefI(cons)
+    {
+        return -1;
+    }
+
+    myTask->tc_Flags &= ~TF_PPC;
+
+    if (!(myLock = Open(name, MODE_OLDFILE)))
+    {
+        goto out;
+    }
+
+    if (!(myFIB = (struct FileInfoBlock*)AllocDosObject(DOS_FIB, NULL)))
+    {
+        /* AllocDosObject failed: 17.13b closes the handle here too (powerpc.s:3369, :3406) (P4) */
+        Close(myLock);
+        goto out;
+    }
+
+    if (!(ExamineFH(myLock, myFIB)))
+    {
+        /* ExamineFH failed (a handler that cannot examine a handle): free the FIB and the handle (P4) */
+        FreeDosObject(DOS_FIB, (APTR)myFIB);
+        Close(myLock);
+        goto out;
+    }
+
+    key.c_Key    = myFIB->fib_DiskKey;
+    key.c_Size   = myFIB->fib_Size;
+    key.c_Days   = myFIB->fib_Date.ds_Days;
+    key.c_Minute = myFIB->fib_Date.ds_Minute;
+    key.c_Tick   = myFIB->fib_Date.ds_Tick;
+    key.c_Name   = nameHash(FilePart(name));
+    key.c_Mode   = 0;
+    key.c_Used   = 0;
+
+    FreeDosObject(DOS_FIB, (APTR)myFIB);
+
+    struct LoadPatch* patches = NULL;
+    ULONG patchCount = 0;
+    ULONG patchBytes = 0;
+
+    if (envMatch("sonnet/LoadNormal", FilePart(name), SysBase, DOSBase))
+    {
+        mode = LS_NORMAL;
+    }
+    else if (envMatch("sonnet/LoadLegacy", FilePart(name), SysBase, DOSBase))
+    {
+        mode = LS_LEGACY;
+    }
+    else
+    {
+        useCache = TRUE;
+
+        if ((mode = cacheFind(&key, SysBase)) < 0)
+        {
+            mode = scanHunks(myLock, &patches, &patchCount, &patchBytes, SysBase, DOSBase);
+
+            if (Seek(myLock, 0, OFFSET_BEGINNING) < 0)
+            {
+                if (patches)
+                {
+                    FreeMem(patches, patchBytes);
+                }
+                Close(myLock);
+                goto out;
+            }
+            if (mode == LS_NORMAL)
+            {
+                cacheAdd(&key, LS_NORMAL, SysBase);
+            }
+        }
+        else if (mode == LS_EHF)
+        {
+            mode = LS_LEGACY;       //(never cached: an EHF is walked at every load for its patch list)
+        }
+    }
+
+    if (mode == LS_NORMAL)
+    {
+        Close(myLock);
+        goto out;
+    }
+
+    if (mode == LS_EHF)
+    {
+        struct FuncTable myFuncTable;
+        struct LoadCtx* ctx = ctxClaim(myLock, LS_EHF, patches, patchCount, SysBase);
+        BPTR mySeglist;
+
+        myTask->tc_Flags |= TF_PPC;
+        myFuncTable.ReadFunc  = (APTR)&ReadFunc;
+        myFuncTable.AllocFunc = (APTR)&AllocFunc;
+        myFuncTable.FreeFunc  = (APTR)&FreeFunc;
+        myFuncTable.Stack     = 0;
+        mySeglist = InternalLoadSeg(myLock, NULL, (LONG*)&myFuncTable, (LONG*)&myFuncTable.Stack);
+
+        ctxRelease(ctx, SysBase);
+
+        if (patches)
+        {
+            FreeMem(patches, patchBytes);
+        }
+
+        if (mySeglist < 0)
+        {
+            UnLoadSeg(-mySeglist);  //an overlay after all (scanHunks refuses them): unloading closes the file
+            goto out;
+        }
+
+        Close(myLock);
+        result = mySeglist;
+        if (mySeglist)
+        {
+            *ppcOut = 1;
+        }
+        goto out;
+    }
+
+    {
+        ULONG kept;
+
+        result = legacyLoad(name, myLock, mode, &key, useCache, &kept, SysBase, DOSBase);
+
+        if (kept)
+        {
+            *ppcOut  = 1;
+            *keepOut = 1;
+            return result;          //TF_PPC stays set, as 17.16 left it
+        }
+    }
+
+out:
+    myTask->tc_Flags &= ~TF_PPC;
+    return result;
+}
+
+/********************************************************************************************/
+
+/* the loading process's TF_PPC before the load, and the seglist's kind, for patchUnLoadSeg and myOpen */
+static void trackLoad(BPTR seg, struct Task* task, ULONG had, ULONG ppc, struct ExecBase* SysBase)
+{
+    if (seg)
+    {
+        struct Process* proc = (struct Process*)task;
+
+        if ((ppc) || ((task->tc_Node.ln_Type == NT_PROCESS) && (proc->pr_CLI)))
+        {
+            segTrackAdd(seg, task, had, ppc, SysBase);
+        }
+    }
+}
+
 PATCH68K BPTR patchLoadSeg(__reg("d1") STRPTR name, __reg("a6") struct DosLibrary* DOSBase)
 {
     BPTR (*LoadSeg_ptr)(__reg("d1") STRPTR, __reg("a6") struct DosLibrary*) = OldLoadSeg;
+    struct ExecBase* SysBase = myPPCBase->PPC_SysLib;
+    struct Task* myTask = SysBase->ThisTask;
+    ULONG hadPPC = myTask->tc_Flags & TF_PPC;
+    ULONG ppc;
+    ULONG keep;
 
     BPTR mySegList;
 
-    mySegList = myLoader(name);
+    mySegList = myLoader(name, &ppc, &keep);
 
     if (mySegList == -1)
     {
-        return ((*LoadSeg_ptr)(name, DOSBase));
+        mySegList = ((*LoadSeg_ptr)(name, DOSBase));    //untagged: a 68k file's hunks in Amiga memory
     }
+    if ((ppc) && (!(keep)))
+    {
+        myTask->tc_Flags = (myTask->tc_Flags & ~TF_PPC) | hadPPC;
+    }
+    trackLoad(mySegList, myTask, hadPPC, ppc, SysBase);
     return mySegList;
 }
 
@@ -923,20 +1912,78 @@ PATCH68K BPTR patchNewLoadSeg(__reg("d1") STRPTR file, __reg("d2") struct TagIte
                      __reg("a6") struct DosLibrary* DOSBase)
 {
     BPTR (*NewLoadSeg_ptr)(__reg("d1") STRPTR, __reg("d2") struct TagItem*, __reg("a6") struct DosLibrary*) = OldNewLoadSeg;
+    struct ExecBase* SysBase = myPPCBase->PPC_SysLib;
+    struct Task* myTask = SysBase->ThisTask;
+    ULONG hadPPC = myTask->tc_Flags & TF_PPC;
+    ULONG ppc = 0;
+    ULONG keep = 0;
 
     BPTR mySegList;
     if (tags)
     {
-        return ((*NewLoadSeg_ptr)(file, tags, DOSBase));
+        mySegList = ((*NewLoadSeg_ptr)(file, tags, DOSBase));
+        trackLoad(mySegList, myTask, hadPPC, 0, SysBase);
+        return mySegList;
     }
 
-    mySegList = myLoader(file);
+    mySegList = myLoader(file, &ppc, &keep);
 
     if (mySegList == -1)
     {
-        return ((*NewLoadSeg_ptr)(file, tags, DOSBase));
+        mySegList = ((*NewLoadSeg_ptr)(file, tags, DOSBase));   //untagged, as patchLoadSeg
     }
+    if ((ppc) && (!(keep)))
+    {
+        myTask->tc_Flags = (myTask->tc_Flags & ~TF_PPC) | hadPPC;
+    }
+    trackLoad(mySegList, myTask, hadPPC, ppc, SysBase);
     return mySegList;
+}
+
+/********************************************************************************************/
+
+/*
+ * 17.17: a Shell gets its TF_PPC back when the command it loaded is unloaded. The command
+ * ran in the Shell's own process, so anything that tagged it then (this library's
+ * OpenLibrary, RunPPC, AllocVec32, a kept 17.16 load) would otherwise stay for every
+ * command after. Only the process that loaded the seglist, only a CLI process unloading
+ * its own command (cli_Module, or 0 when the Shell has cleared it first), and only when
+ * it was not tagged before the load: a program unloading a plugin of its own is left
+ * alone.
+ */
+PATCH68K BOOL patchUnLoadSeg(__reg("d1") BPTR seglist, __reg("a6") struct DosLibrary* DOSBase)
+{
+    BOOL (*UnLoadSeg_ptr)(__reg("d1") BPTR, __reg("a6") struct DosLibrary*) = OldUnLoadSeg;
+
+    if (seglist)
+    {
+        struct ExecBase* SysBase = myPPCBase->PPC_SysLib;
+        struct Task* myTask = SysBase->ThisTask;
+
+        Forbid();
+
+        for (int i = 0; i < SEGTRACK_MAX; i++)
+        {
+            if (segTrack[i].st_Seg == seglist)
+            {
+                if ((segTrack[i].st_Task == myTask) && (!(segTrack[i].st_Had)) && (myTask->tc_Node.ln_Type == NT_PROCESS))
+                {
+                    struct CommandLineInterface* cli = (struct CommandLineInterface*)((ULONG)(((struct Process*)myTask)->pr_CLI << 2));
+
+                    if ((cli) && ((cli->cli_Module == seglist) || (!(cli->cli_Module))))
+                    {
+                        myTask->tc_Flags &= ~TF_PPC;
+                    }
+                }
+                segTrack[i].st_Seg = 0;
+                break;
+            }
+        }
+
+        Permit();
+    }
+
+    return ((*UnLoadSeg_ptr)(seglist, DOSBase));
 }
 
 /********************************************************************************************
